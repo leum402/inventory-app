@@ -1,51 +1,41 @@
 import os
-import sqlite3
 from flask import Flask, render_template_string, request, redirect
+from flask_sqlalchemy import SQLAlchemy
 from collections import defaultdict
 
 app = Flask(__name__)
-DB_NAME = 'inventory.db'
 
-# DB 초기화
-def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS inventory (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            product_name TEXT NOT NULL,
-            sku TEXT NOT NULL,
-            option TEXT,
-            location TEXT DEFAULT '본사',
-            inbound INTEGER DEFAULT 0,
-            outbound INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    conn.commit()
-    conn.close()
+# Render PostgreSQL 연결 주소
+app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://inventory_user:8mdkay8gO99mIr4hOyKaI80OoUxBNguG@dpg-d1n04pvdiees73ehph90-a/inventory_oqde'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-# 현재고 계산
-def get_inventory():
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT id, product_name, sku, option, location, inbound, outbound, (inbound - outbound) as current_stock FROM inventory")
-    rows = c.fetchall()
-    conn.close()
-    return rows
+db = SQLAlchemy(app)
 
-# SKU별 위치 구분 재고 요약
+# 📦 테이블 정의
+class Inventory(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    product_name = db.Column(db.String(120), nullable=False)
+    sku = db.Column(db.String(80), nullable=False)
+    option = db.Column(db.String(120), nullable=True)
+    location = db.Column(db.String(20), default='본사')
+    inbound = db.Column(db.Integer, default=0)
+    outbound = db.Column(db.Integer, default=0)
+
+    @property
+    def current_stock(self):
+        return self.inbound - self.outbound
+
+# 📊 요약 계산
 def get_inventory_summary():
-    inventory = get_inventory()
+    all_items = Inventory.query.all()
     summary = defaultdict(lambda: {'본사': 0, '3PL': 0, 'info': {}})
-    for row in inventory:
-        _, name, sku, option, location, _, _, stock = row
-        key = (sku, option)
-        summary[key]['info'] = {'product_name': name, 'sku': sku, 'option': option}
-        summary[key][location] += stock
+    for item in all_items:
+        key = (item.sku, item.option or '')
+        summary[key]['info'] = {'product_name': item.product_name, 'sku': item.sku, 'option': item.option or ''}
+        summary[key][item.location] += item.current_stock
     return summary
 
-# HTML 템플릿
+# 🖼️ HTML 템플릿 (Jinja2)
 template = '''
 <!doctype html>
 <html lang="ko">
@@ -60,7 +50,7 @@ template = '''
             form.style.display = form.style.display === 'none' ? 'block' : 'none';
         }
         function toggleDeleteButton() {
-            const selected = document.querySelectorAll('input[name="delete_skus"]:checked');
+            const selected = document.querySelectorAll('input[name=\"delete_skus\"]:checked');
             document.getElementById('delete-selected-btn').style.display = selected.length > 0 ? 'inline-block' : 'none';
         }
     </script>
@@ -71,15 +61,15 @@ template = '''
     <form method="post" action="/update" class="row g-3 mb-5">
         <div class="col-md-3">
             <label class="form-label">SKU</label>
-            <input type="text" name="sku" class="form-control" placeholder="SKU" required>
+            <input type="text" name="sku" class="form-control" required>
         </div>
         <div class="col-md-2">
             <label class="form-label">입고 수량</label>
-            <input type="number" name="inbound" class="form-control" placeholder="입고" value="0">
+            <input type="number" name="inbound" class="form-control" value="0">
         </div>
         <div class="col-md-2">
             <label class="form-label">출고 수량</label>
-            <input type="number" name="outbound" class="form-control" placeholder="출고" value="0">
+            <input type="number" name="outbound" class="form-control" value="0">
         </div>
         <div class="col-md-3">
             <label class="form-label">위치</label>
@@ -158,19 +148,16 @@ template = '''
 @app.route('/')
 def index():
     summary = get_inventory_summary()
-    rows = get_inventory()
-    return render_template_string(template, rows=rows, summary=summary)
+    return render_template_string(template, summary=summary)
 
 @app.route('/add', methods=['POST'])
 def add_product():
     product_name = request.form['product_name']
     sku = request.form['sku']
     option = request.form.get('option', '')
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("INSERT INTO inventory (product_name, sku, option, location) VALUES (?, ?, ?, '본사')", (product_name, sku, option))
-    conn.commit()
-    conn.close()
+    new_item = Inventory(product_name=product_name, sku=sku, option=option, location='본사')
+    db.session.add(new_item)
+    db.session.commit()
     return redirect('/')
 
 @app.route('/update', methods=['POST'])
@@ -180,46 +167,34 @@ def update_stock():
     outbound = int(request.form['outbound'])
     location = request.form.get('location', '본사')
 
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-
-    # SKU + location 존재 여부 확인
-    c.execute("SELECT COUNT(*) FROM inventory WHERE sku = ? AND location = ?", (sku, location))
-    exists = c.fetchone()[0]
-
-    if exists:
-        c.execute("UPDATE inventory SET inbound = inbound + ?, outbound = outbound + ? WHERE sku = ? AND location = ?",
-                  (inbound, outbound, sku, location))
+    item = Inventory.query.filter_by(sku=sku, location=location).first()
+    if item:
+        item.inbound += inbound
+        item.outbound += outbound
     else:
-        # 기존 product_name과 option 가져오기
-        c.execute("SELECT product_name, option FROM inventory WHERE sku = ? LIMIT 1", (sku,))
-        result = c.fetchone()
-        if result:
-            product_name, option = result
-        else:
-            product_name, option = sku, ''
-
-        c.execute("INSERT INTO inventory (product_name, sku, option, location, inbound, outbound) VALUES (?, ?, ?, ?, ?, ?)",
-                  (product_name, sku, option, location, inbound, outbound))
-
-    conn.commit()
-    conn.close()
+        # 이름과 옵션은 해당 SKU의 기존 데이터에서 가져옴
+        fallback = Inventory.query.filter_by(sku=sku).first()
+        product_name = fallback.product_name if fallback else sku
+        option = fallback.option if fallback else ''
+        item = Inventory(product_name=product_name, sku=sku, option=option, location=location,
+                         inbound=inbound, outbound=outbound)
+        db.session.add(item)
+    db.session.commit()
     return redirect('/')
 
 @app.route('/delete-selected', methods=['POST'])
 def delete_selected():
     sku_options = request.form.getlist('delete_skus')
-    if sku_options:
-        split_keys = [tuple(s.split('||')) for s in sku_options]
-        conn = sqlite3.connect(DB_NAME)
-        c = conn.cursor()
-        for sku, option in split_keys:
-            c.execute("DELETE FROM inventory WHERE sku = ? AND option = ?", (sku, option))
-        conn.commit()
-        conn.close()
+    for pair in sku_options:
+        sku, option = pair.split('||')
+        items = Inventory.query.filter_by(sku=sku, option=option).all()
+        for item in items:
+            db.session.delete(item)
+    db.session.commit()
     return redirect('/')
 
-# Render 환경 변수 포트 사용
-port = int(os.environ.get("PORT", 5000))
-init_db()
-app.run(host="0.0.0.0", port=port)
+# 포트 바인딩 (for Render)
+if __name__ == "__main__":
+    db.create_all()
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
